@@ -1,0 +1,10 @@
+node_modules
+functions/node_modules
+functions/lib
+.expo
+dist
+coverage
+bun.lock
+package-lock.json
+functions/package-lock.json
+assets
