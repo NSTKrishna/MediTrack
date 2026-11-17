@@ -1,0 +1,322 @@
+rules_version = '2';
+
+// MediTrack Firestore security rules.
+//
+// Principles
+// - Deny by default. Every collection is listed explicitly.
+// - Patients own everything under /users/{patientId}.
+// - Caregivers are read-only. They read a patient's data only through an active care link
+//   (/careLinks/{patientId}_{caregiverId}) whose permission for that data is true.
+// - Stock never changes on its own: every change to remainingStock must be paired, in the same
+//   transaction, with a new immutable inventory transaction that explains it.
+// - Care alerts are written only by Cloud Functions (Admin SDK bypasses these rules).
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function isUser(uid) { return signedIn() && request.auth.uid == uid; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function onlyChanges(keys) {
+      return incoming().diff(existing()).affectedKeys().hasOnly(keys);
+    }
+    function userDoc(uid) { return /databases/$(database)/documents/users/$(uid); }
+    function profile() { return get(userDoc(request.auth.uid)).data; }
+    function emailVerified() {
+      return signedIn() && request.auth.token.email_verified == true;
+    }
+
+    // ---------- caregiver access ----------
+    function linkFor(patientId) {
+      return /databases/$(database)/documents/careLinks/$(patientId + '_' + request.auth.uid);
+    }
+    function caregiverCan(patientId, permission) {
+      return signedIn()
+        && exists(linkFor(patientId))
+        && get(linkFor(patientId)).data.status == 'active'
+        && get(linkFor(patientId)).data.permissions[permission] == true;
+    }
+    function canRead(patientId, permission) {
+      return isUser(patientId) || caregiverCan(patientId, permission);
+    }
+
+    // Data permissions depend on each other: inventory needs medicines, alerts need the data
+    // they describe. Patients can grant any valid combination and change it at any time.
+    function validPermissions(p) {
+      return p is map
+        && p.keys().hasAll(['viewMedicines', 'viewDoseHistory', 'viewInventory',
+                            'missedDoseAlerts', 'lowStockAlerts'])
+        && p.keys().hasOnly(['viewMedicines', 'viewDoseHistory', 'viewInventory',
+                             'missedDoseAlerts', 'lowStockAlerts'])
+        && p.viewMedicines is bool && p.viewDoseHistory is bool && p.viewInventory is bool
+        && p.missedDoseAlerts is bool && p.lowStockAlerts is bool
+        && (!p.viewInventory || p.viewMedicines)
+        && (!p.missedDoseAlerts || p.viewDoseHistory)
+        && (!p.lowStockAlerts || p.viewInventory);
+    }
+
+    // ---------- users ----------
+    match /users/{userId} {
+      allow read: if isUser(userId);
+      allow create: if isUser(userId)
+        && incoming().keys().hasOnly(['email', 'displayName', 'role', 'timeZone', 'createdAt'])
+        && incoming().role in ['patient', 'caregiver']
+        && incoming().email == request.auth.token.email
+        && incoming().displayName is string
+        && incoming().displayName.size() > 0 && incoming().displayName.size() <= 80;
+      // Role and email are immutable from the client.
+      allow update: if isUser(userId)
+        && onlyChanges(['displayName', 'timeZone', 'updatedAt'])
+        && incoming().displayName is string
+        && incoming().displayName.size() > 0 && incoming().displayName.size() <= 80;
+      allow delete: if false;
+
+      // ---------- medicines ----------
+      function validMedicine(m) {
+        return m.userId == userId
+          && m.name is string && m.name.size() > 0 && m.name.size() <= 100
+          && m.scheduledTimes is list && m.scheduledTimes.size() <= 12
+          && m.selectedWeekdays is list && m.selectedWeekdays.size() <= 7
+          && m.stockQuantity is int && m.stockQuantity >= 0
+          && m.remainingStock is int && m.remainingStock >= 0
+          && m.lowStockThreshold is int && m.lowStockThreshold >= 0
+          && m.active is bool;
+      }
+      function txPath(txId) {
+        return /databases/$(database)/documents/users/$(userId)/inventoryTransactions/$(txId);
+      }
+      // A stock change must point at a brand-new inventory transaction created in the same
+      // write whose before/after values match this document exactly.
+      function stockChangeIsRecorded(medicineId) {
+        let txId = incoming().lastInventoryTxId;
+        return txId is string
+          && txId != existing().get('lastInventoryTxId', '')
+          && !exists(txPath(txId))
+          && existsAfter(txPath(txId))
+          && getAfter(txPath(txId)).data.medicineId == medicineId
+          && getAfter(txPath(txId)).data.previousStock == existing().remainingStock
+          && getAfter(txPath(txId)).data.resultingStock == incoming().remainingStock;
+      }
+
+      match /medicines/{medicineId} {
+        allow read: if canRead(userId, 'viewMedicines');
+        allow create: if isUser(userId)
+          && validMedicine(incoming())
+          && incoming().remainingStock == incoming().stockQuantity
+          && !('lastInventoryTxId' in incoming());
+        allow update: if isUser(userId)
+          && existing().userId == userId
+          && validMedicine(incoming())
+          && (
+            (incoming().remainingStock == existing().remainingStock
+              && incoming().get('lastInventoryTxId', '') == existing().get('lastInventoryTxId', ''))
+            || stockChangeIsRecorded(medicineId)
+          );
+        allow delete: if isUser(userId);
+      }
+
+      // ---------- doses ----------
+      function dosePath(doseId) {
+        return /databases/$(database)/documents/users/$(userId)/doses/$(doseId);
+      }
+      function medicinePath(medicineId) {
+        return /databases/$(database)/documents/users/$(userId)/medicines/$(medicineId);
+      }
+      // A taken dose either deducted stock (and its inventory transaction exists after this
+      // write) or was taken while the medicine had no stock left / no longer exists.
+      function takenDoseConsistent(doseId, d) {
+        return d.stockDeducted == true
+          ? existsAfter(txPath('dose_' + doseId))
+          : (!exists(medicinePath(d.medicineId))
+              || get(medicinePath(d.medicineId)).data.remainingStock == 0);
+      }
+
+      match /doses/{doseId} {
+        allow read: if canRead(userId, 'viewDoseHistory');
+        allow create: if isUser(userId)
+          && incoming().keys().hasOnly(['medicineId', 'medicineName', 'scheduledFor', 'slotKey',
+                                        'outcome', 'recordedAt', 'source', 'stockDeducted',
+                                        'createdAt'])
+          && incoming().medicineId is string
+          && incoming().medicineName is string && incoming().medicineName.size() <= 100
+          && incoming().slotKey is string && incoming().slotKey.matches('^[0-9]{8}T[0-9]{4}Z$')
+          && doseId == incoming().medicineId + '_' + incoming().slotKey
+          && incoming().scheduledFor is string
+          && incoming().recordedAt is string
+          && incoming().source in ['app', 'notification']
+          && incoming().stockDeducted is bool
+          && incoming().outcome in ['taken', 'skipped']
+          && (incoming().outcome == 'skipped'
+                ? incoming().stockDeducted == false
+                : takenDoseConsistent(doseId, incoming()));
+        // The only permitted change is a skipped dose later confirmed as taken.
+        allow update: if isUser(userId)
+          && existing().outcome == 'skipped'
+          && incoming().outcome == 'taken'
+          && onlyChanges(['outcome', 'recordedAt', 'source', 'stockDeducted'])
+          && incoming().source in ['app', 'notification']
+          && incoming().stockDeducted is bool
+          && takenDoseConsistent(doseId, incoming());
+        allow delete: if false;
+      }
+
+      // ---------- inventory transactions (append-only ledger) ----------
+      match /inventoryTransactions/{txId} {
+        allow read: if canRead(userId, 'viewInventory');
+        allow create: if isUser(userId)
+          && incoming().keys().hasOnly(['medicineId', 'medicineName', 'reason', 'delta',
+                                        'previousStock', 'resultingStock', 'lowStockThreshold',
+                                        'doseId', 'recordedAt', 'createdAt'])
+          && incoming().medicineId is string
+          && incoming().medicineName is string
+          && incoming().delta is int
+          && incoming().previousStock is int
+          && incoming().resultingStock is int
+          && incoming().lowStockThreshold is int
+          && incoming().recordedAt is string
+          && incoming().resultingStock == incoming().previousStock + incoming().delta
+          && incoming().resultingStock >= 0
+          && getAfter(medicinePath(incoming().medicineId)).data.lastInventoryTxId == txId
+          && getAfter(medicinePath(incoming().medicineId)).data.remainingStock
+               == incoming().resultingStock
+          && (
+            (incoming().reason == 'dose'
+              && incoming().delta == -1
+              && incoming().doseId is string
+              && txId == 'dose_' + incoming().doseId
+              && getAfter(dosePath(incoming().doseId)).data.outcome == 'taken'
+              && getAfter(dosePath(incoming().doseId)).data.medicineId == incoming().medicineId)
+            || (incoming().reason == 'refill'
+              && txId.matches('^refill_[A-Za-z0-9]{10,40}$')
+              && !('doseId' in incoming())
+              && incoming().delta >= 1 && incoming().delta <= 1000)
+          );
+        allow update, delete: if false;
+      }
+
+      // ---------- device push tokens (used by Cloud Functions to reach caregivers) ----------
+      match /pushTokens/{tokenId} {
+        allow read, delete: if isUser(userId);
+        allow create, update: if isUser(userId)
+          && incoming().keys().hasOnly(['token', 'platform', 'updatedAt'])
+          && incoming().token is string && incoming().token.size() <= 256
+          && incoming().platform in ['ios', 'android', 'web'];
+      }
+
+      // ---------- care alerts (written by Cloud Functions) ----------
+      match /alerts/{alertId} {
+        allow read: if isUser(userId);
+        allow update: if isUser(userId) && onlyChanges(['readAt']) && incoming().readAt is timestamp;
+        allow create, delete: if false;
+      }
+    }
+
+    // ---------- caregiver invitations ----------
+    function inviteeMatches() {
+      return emailVerified() && existing().inviteeEmail == request.auth.token.email;
+    }
+    function linkPathFor(patientId, caregiverId) {
+      return /databases/$(database)/documents/careLinks/$(patientId + '_' + caregiverId);
+    }
+
+    match /invitations/{invitationId} {
+      allow read: if signedIn()
+        && (existing().patientId == request.auth.uid
+            || (emailVerified() && existing().inviteeEmail == request.auth.token.email));
+      allow create: if signedIn()
+        && incoming().patientId == request.auth.uid
+        && profile().role == 'patient'
+        && incoming().keys().hasOnly(['patientId', 'patientName', 'inviteeEmail', 'permissions',
+                                      'status', 'createdAt', 'expiresAt'])
+        && incoming().patientName == profile().displayName
+        && incoming().status == 'pending'
+        && incoming().inviteeEmail is string
+        && incoming().inviteeEmail.size() <= 254
+        && incoming().inviteeEmail.matches('^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$')
+        && incoming().inviteeEmail == incoming().inviteeEmail.lower()
+        && incoming().inviteeEmail != request.auth.token.email
+        && validPermissions(incoming().permissions)
+        && incoming().createdAt == request.time
+        && incoming().expiresAt is timestamp
+        && incoming().expiresAt > request.time
+        && incoming().expiresAt <= request.time + duration.value(14, 'd');
+      allow update: if signedIn() && existing().status == 'pending' && (
+        // The patient withdraws a pending invitation.
+        (existing().patientId == request.auth.uid
+          && incoming().status == 'revoked'
+          && onlyChanges(['status', 'respondedAt'])
+          && incoming().respondedAt == request.time)
+        // The invited caregiver declines.
+        || (inviteeMatches()
+          && incoming().status == 'declined'
+          && onlyChanges(['status', 'respondedAt'])
+          && incoming().respondedAt == request.time)
+        // The invited caregiver accepts, creating the care link in the same batch.
+        || (inviteeMatches()
+          && request.time < existing().expiresAt
+          && incoming().status == 'accepted'
+          && onlyChanges(['status', 'respondedAt', 'acceptedBy'])
+          && incoming().respondedAt == request.time
+          && incoming().acceptedBy == request.auth.uid
+          && existsAfter(linkPathFor(existing().patientId, request.auth.uid))
+          && getAfter(linkPathFor(existing().patientId, request.auth.uid)).data.invitationId
+               == invitationId)
+      );
+      allow delete: if false;
+    }
+
+    // ---------- care links ----------
+    // A link can only come into being by accepting a pending invitation addressed to the
+    // caregiver's verified email, with exactly the permissions the patient chose.
+    function validActivation(linkId) {
+      let link = incoming();
+      let invitationPath = /databases/$(database)/documents/invitations/$(link.invitationId);
+      let invitationAfter = getAfter(invitationPath).data;
+      return link.keys().hasOnly(['patientId', 'patientName', 'caregiverId', 'caregiverName',
+                                  'caregiverEmail', 'permissions', 'status', 'invitationId',
+                                  'createdAt', 'updatedAt'])
+        && link.caregiverId == request.auth.uid
+        && linkId == link.patientId + '_' + request.auth.uid
+        && link.status == 'active'
+        && link.invitationId is string
+        && profile().role == 'caregiver'
+        && link.caregiverName == profile().displayName
+        && link.caregiverEmail == request.auth.token.email
+        && validPermissions(link.permissions)
+        && get(invitationPath).data.status == 'pending'
+        && invitationAfter.status == 'accepted'
+        && invitationAfter.acceptedBy == request.auth.uid
+        && invitationAfter.patientId == link.patientId
+        && invitationAfter.patientName == link.patientName
+        && invitationAfter.permissions == link.permissions;
+    }
+
+    match /careLinks/{linkId} {
+      allow read: if signedIn()
+        && (existing().patientId == request.auth.uid || existing().caregiverId == request.auth.uid);
+      allow create: if signedIn() && validActivation(linkId);
+      allow update: if signedIn() && (
+        // Re-activation after an earlier revocation, through a new accepted invitation.
+        (existing().status == 'revoked' && validActivation(linkId))
+        // The patient changes what the caregiver may see (consent controls).
+        || (existing().patientId == request.auth.uid
+          && existing().status == 'active'
+          && onlyChanges(['permissions', 'updatedAt'])
+          && validPermissions(incoming().permissions))
+        // Either party ends the relationship.
+        || ((existing().patientId == request.auth.uid || existing().caregiverId == request.auth.uid)
+          && existing().status == 'active'
+          && incoming().status == 'revoked'
+          && incoming().revokedBy == request.auth.uid
+          && incoming().revokedAt == request.time
+          && onlyChanges(['status', 'revokedBy', 'revokedAt', 'updatedAt']))
+      );
+      allow delete: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

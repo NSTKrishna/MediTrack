@@ -1,0 +1,10 @@
+rules_version = '2';
+// MediTrack does not use Cloud Storage. Deny everything so that enabling a bucket later cannot
+// expose files by default; reports are generated on-device and shared by the user.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
