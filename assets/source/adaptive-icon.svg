@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs><clipPath id="capsule"><rect x="292" y="422" width="440" height="180" rx="90"/></clipPath></defs>
+  <g transform="rotate(-45 512 512)">
+    <rect x="300" y="434" width="440" height="180" rx="90" fill="#0A3A63" opacity="0.35"/>
+    <g clip-path="url(#capsule)">
+      <rect x="292" y="422" width="220" height="180" fill="#FFFFFF"/>
+      <rect x="512" y="422" width="220" height="180" fill="#3DBB8F"/>
+      <rect x="292" y="422" width="440" height="52" fill="#FFFFFF" opacity="0.18"/>
+    </g>
+  </g>
+</svg>
